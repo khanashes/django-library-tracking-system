@@ -1,10 +1,12 @@
+from datetime import timedelta
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from .models import Author, Book, Member, Loan
-from .serializers import AuthorSerializer, BookSerializer, MemberSerializer, LoanSerializer
+from .serializers import AuthorSerializer, BookSerializer, MemberSerializer, LoanSerializer,TopActiveMemberSerializer
 from rest_framework.decorators import action
 from django.utils import timezone
 from .tasks import send_loan_notification
+from django.db.models import Q, Count
 
 class AuthorViewSet(viewsets.ModelViewSet):
     queryset = Author.objects.all()
@@ -49,6 +51,46 @@ class MemberViewSet(viewsets.ModelViewSet):
     queryset = Member.objects.all()
     serializer_class = MemberSerializer
 
+    @action(detail=False, methods=["get"], url_path="top-active")
+    def top_active(self, request):
+        members = Member.objects.annotate(
+            active_loans=Count("loans", filter=Q(loans__is_returned=False))
+        ).filter(active_loans__gt=0).order_by("-active_loans")
+        serializer = TopActiveMemberSerializer(members, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
 class LoanViewSet(viewsets.ModelViewSet):
     queryset = Loan.objects.all()
     serializer_class = LoanSerializer
+
+
+    @action(detail=True, methods=["post"])
+    def extend_due_date(self, request, pk=None):
+        """Extend the due date of a loan by a given number of days."""
+        loan = self.get_object()
+        raw_additional_days = request.data.get("additional_days")
+
+        try:
+            additional_days = int(raw_additional_days)
+            if additional_days <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "additional_days must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if loan.due_date and loan.due_date < timezone.now().date():
+            return Response(
+                {"error": "Due date is already overdue."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not loan.due_date:
+            loan.due_date = loan.loan_date
+
+        loan.due_date += timedelta(days=additional_days)
+        loan.save(update_fields=["due_date"])
+
+        serializer = LoanSerializer(loan)
+        return Response(serializer.data, status=status.HTTP_200_OK)
